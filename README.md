@@ -2,14 +2,15 @@
 
 Standalone Node script that exports founder-level data for **every Y Combinator company** (or a filtered ICP slice). Pulls company metadata + founder names, titles, LinkedIn, Twitter, bio + currently-open hiring roles from Work-at-a-Startup. Optional verified-email lookup via [MailsFinder](https://mailsfinder.com).
 
-Single file. No dependencies beyond Node 20+. Two modes:
+Single file. No dependencies beyond Node 20+. Three modes:
 
 | Mode | Command | Purpose |
 |---|---|---|
 | **Filtered ICP leads** (default) | `node scrape.js` | Only currently-hiring YC companies in your ICP. Designed for B2B outbound. |
 | **Full export** | `node scrape.js --all` | Every YC company (~5,690), every listed founder. No filters. |
+| **Watch (diff vs prior run)** | `node scrape.js --watch` | Run on a schedule. Detects new/updated/removed rows since last run. Optional Slack notification. |
 
-Both modes use the same output schema.
+All three modes use the same output schema.
 
 ## What you get
 
@@ -104,6 +105,114 @@ The script also tries common nicknames (Christian → Chris, Michael → Mike, e
 ## Why this exists
 
 Built as part of a larger B2B intent-signals scraper ([b2b-intent-signals-scraper](https://github.com/harsh719/b2b-intent-signals-scraper)) that pulls from 7 sources. After production runs across all sources, **YC + MailsFinder consistently outperformed every other source** for clean post-seed B2B leads in Fintech/Healthtech/HR Tech. This standalone version captures that pattern in 300 lines, no Apify SDK overhead, no LinkedIn-Jobs noise.
+
+## Watch mode — detect changes between runs
+
+YC doesn't push notifications. To stay in sync with what changes upstream, run the scraper on a schedule and let it diff each run against the previous one.
+
+```bash
+# Initial baseline
+node scrape.js --all --watch --master=master.json --changes-out=changes.json
+
+# Subsequent runs (cron / GitHub Action / Apify schedule)
+node scrape.js --all --watch --master=master.json --changes-out=changes.json
+```
+
+Each run:
+1. Re-scrapes the configured set (filtered or `--all`).
+2. Loads the previous snapshot from `--master` (the rolling truth file).
+3. Diffs new vs old, keyed by `company_name + full_name`.
+4. Writes a structured `changes.json` containing `new`, `updated` (with the exact list of fields that changed), and `removed` rows.
+5. Overwrites `--master` with the new state.
+
+### Watch flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--watch` | off | Enables diff mode. |
+| `--master=path` | `leads.json` | Rolling master file. Read on entry, overwritten on exit. |
+| `--changes-out=path` | `changes.json` | Diff output for the current run only. |
+| `--slack=URL` *(or `SLACK_WEBHOOK_URL` env)* | none | Slack incoming webhook. When set, posts a summary of the diff. |
+
+### `changes.json` shape
+
+```json
+{
+  "run_at": "2026-04-28T16:00:00.000Z",
+  "summary": {
+    "new": 12,
+    "updated": 47,
+    "removed": 3,
+    "by_field": { "team_size": 18, "hiring_roles": 22, "is_hiring": 9 }
+  },
+  "changes": [
+    { "type": "new", "row": { ... full row ... } },
+    {
+      "type": "updated",
+      "before": { ... old row ... },
+      "after":  { ... new row ... },
+      "changed_fields": ["team_size", "hiring_roles"]
+    },
+    { "type": "removed", "row": { ... old row ... } }
+  ]
+}
+```
+
+### What changes get caught
+
+| Source | Fields that move |
+|---|---|
+| `yc-oss/api/companies/all.json` (refreshed daily) | `team_size`, `is_hiring`, `industry`, `sub_industry`, `location`, `website`, `batch`, `description_short`, `description_long` |
+| `ycombinator.com/companies/<slug>` | Founder added/removed, `title`, `linkedin_url`, `twitter_url`, `bio` |
+| `workatastartup.com/companies/<slug>` | `hiring_roles` (each posted/removed job) |
+
+Volatile fields (`email_status`, `yc_page`) are **excluded** from the diff so transient enrichment differences don't generate noise.
+
+### Scheduling examples
+
+**Local cron (daily at 06:00):**
+```cron
+0 6 * * * cd /path/to/yc-startup-leads-scraper && /usr/local/bin/node scrape.js --all --watch --slack="$SLACK_WEBHOOK_URL" >> /var/log/yc-watch.log 2>&1
+```
+
+**GitHub Actions (free, public repos)** — drop this into `.github/workflows/watch.yml`:
+```yaml
+name: YC watch
+on:
+  schedule: [{ cron: '0 6 * * *' }]
+  workflow_dispatch:
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Restore master from previous run
+        uses: actions/cache@v4
+        with: { path: master.json, key: yc-master-v1 }
+      - run: node scrape.js --all --watch --master=master.json --changes-out=changes.json
+        env: { SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }} }
+      - uses: actions/upload-artifact@v4
+        with: { name: changes, path: changes.json }
+```
+
+**Apify schedule** — wrap the standalone in an Apify actor (see the companion [`b2b-intent-signals-scraper`](https://github.com/harsh719/b2b-intent-signals-scraper) for the structure), then set a daily schedule from the Apify Console.
+
+### Slack notification
+
+When `--slack=URL` (or `SLACK_WEBHOOK_URL` env) is set, each watch run posts a summary message:
+
+```
+:satellite: *YC scrape complete* — 12 new, 47 updated, 3 removed
+Fields changed: hiring_roles=22, team_size=18, is_hiring=9, title=4, location=2, bio=1
+• :new: Acme Health — Jane Doe (CEO)
+• :pencil2: ClaimSorted — Pavel Gertsberg: hiring_roles, team_size
+• :pencil2: Coval — Brooke Hopkins: bio
+• :x: ZombieCo — John Smith (removed)
+```
+
+Only "interesting" updates are surfaced inline (changes to `is_hiring`, `hiring_roles`, `team_size`, `title`). The full diff is always in `changes.json`.
 
 ## License
 

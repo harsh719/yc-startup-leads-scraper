@@ -341,6 +341,78 @@ function writeCsv(filePath, rows) {
 }
 
 // ============================================================================
+// Diff + watch — detect changes between runs
+// ============================================================================
+
+// Compare two arrays of rows. Identity is (company_name + full_name).
+// Returns one of three classifications per row + the list of fields that
+// changed for `updated` rows.
+function diffSnapshots(oldRows, newRows) {
+    const keyOf = (r) => `${(r.company_name || '').toLowerCase()}|${(r.full_name || '').toLowerCase()}`;
+    const oldByKey = new Map((oldRows || []).map((r) => [keyOf(r), r]));
+    const newByKey = new Map((newRows || []).map((r) => [keyOf(r), r]));
+    const allKeys = new Set([...oldByKey.keys(), ...newByKey.keys()]);
+
+    // Fields we ignore in the diff (volatile or irrelevant).
+    const IGNORE = new Set(['email_status', 'yc_page']);
+
+    const changes = [];
+    for (const k of allKeys) {
+        const o = oldByKey.get(k);
+        const n = newByKey.get(k);
+        if (!o && n) { changes.push({ type: 'new', row: n }); continue; }
+        if (o && !n) { changes.push({ type: 'removed', row: o }); continue; }
+        const changedFields = [];
+        for (const field of Object.keys(n)) {
+            if (IGNORE.has(field)) continue;
+            if (String(o[field] ?? '') !== String(n[field] ?? '')) changedFields.push(field);
+        }
+        if (changedFields.length > 0) {
+            changes.push({ type: 'updated', before: o, after: n, changed_fields: changedFields });
+        }
+    }
+    return changes;
+}
+
+function summarizeChanges(changes) {
+    const out = { new: 0, updated: 0, removed: 0, by_field: {} };
+    for (const c of changes) {
+        out[c.type]++;
+        if (c.type === 'updated') {
+            for (const f of c.changed_fields) out.by_field[f] = (out.by_field[f] ?? 0) + 1;
+        }
+    }
+    return out;
+}
+
+async function notifySlack(webhookUrl, summary, changes) {
+    if (!webhookUrl) return;
+    const lines = [
+        `:satellite: *YC scrape complete* — ${summary.new} new, ${summary.updated} updated, ${summary.removed} removed`,
+    ];
+    if (Object.keys(summary.by_field).length > 0) {
+        const top = Object.entries(summary.by_field).sort((a, b) => b[1] - a[1]).slice(0, 6);
+        lines.push('Fields changed: ' + top.map(([f, n]) => `${f}=${n}`).join(', '));
+    }
+    // Surface up to 6 most interesting items
+    const interesting = changes.filter((c) => c.type !== 'updated' || c.changed_fields.some((f) => ['is_hiring', 'hiring_roles', 'team_size', 'title'].includes(f))).slice(0, 6);
+    for (const c of interesting) {
+        if (c.type === 'new') lines.push(`• :new: ${c.row.company_name} — ${c.row.full_name} (${c.row.title})`);
+        else if (c.type === 'removed') lines.push(`• :x: ${c.row.company_name} — ${c.row.full_name} (removed)`);
+        else lines.push(`• :pencil2: ${c.after.company_name} — ${c.after.full_name}: ${c.changed_fields.join(', ')}`);
+    }
+    try {
+        await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: lines.join('\n') }),
+        });
+    } catch (e) {
+        console.error('Slack notify failed:', e.message);
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -348,6 +420,10 @@ async function main() {
     const argv = process.argv.slice(2);
     const cfgPath = argv.find((a) => a.startsWith('--config='))?.split('=')[1] || 'config.json';
     const allFlag = argv.includes('--all');
+    const watchFlag = argv.includes('--watch');
+    const slackFlag = argv.find((a) => a.startsWith('--slack='))?.split('=')[1] || process.env.SLACK_WEBHOOK_URL || '';
+    const masterFlag = argv.find((a) => a.startsWith('--master='))?.split('=')[1] || 'leads.json';
+    const changesFlag = argv.find((a) => a.startsWith('--changes-out='))?.split('=')[1] || 'changes.json';
     let cfg = { ...DEFAULTS };
     if (fs.existsSync(cfgPath)) {
         try {
@@ -420,15 +496,50 @@ async function main() {
     const verified = allRows.filter((r) => r.email_status === 'verified');
     const withRoles = allRows.filter((r) => r.hiring_roles).length;
 
-    writeCsv(cfg.output.csvPath, allRows);
-    fs.writeFileSync(cfg.output.jsonPath, JSON.stringify(allRows, null, 2));
+    // ===== Watch mode: diff vs previous master, persist updates, notify =====
+    if (watchFlag) {
+        let oldRows = [];
+        if (fs.existsSync(masterFlag)) {
+            try {
+                oldRows = JSON.parse(fs.readFileSync(masterFlag, 'utf-8'));
+                console.log(`Loaded previous snapshot from ${masterFlag} (${oldRows.length} rows)`);
+            } catch (e) {
+                console.error(`Could not parse ${masterFlag}: ${e}. Treating as first run.`);
+            }
+        } else {
+            console.log(`No prior master at ${masterFlag} — first run, all rows will be 'new'.`);
+        }
+        const changes = diffSnapshots(oldRows, allRows);
+        const summary = summarizeChanges(changes);
+        const changeReport = {
+            run_at: new Date().toISOString(),
+            summary,
+            changes,
+        };
+        fs.writeFileSync(changesFlag, JSON.stringify(changeReport, null, 2));
+        // Update the master so the next run diffs against this state.
+        fs.writeFileSync(masterFlag, JSON.stringify(allRows, null, 2));
+        console.log(`\nWatch summary: ${summary.new} new, ${summary.updated} updated, ${summary.removed} removed`);
+        if (Object.keys(summary.by_field).length > 0) {
+            const top = Object.entries(summary.by_field).sort((a, b) => b[1] - a[1]).slice(0, 6);
+            console.log(`  Fields changed: ${top.map(([f, n]) => `${f}=${n}`).join(', ')}`);
+        }
+        console.log(`  Master: ${path.resolve(masterFlag)}`);
+        console.log(`  Changes: ${path.resolve(changesFlag)}`);
+        await notifySlack(slackFlag, summary, changes);
+    } else {
+        writeCsv(cfg.output.csvPath, allRows);
+        fs.writeFileSync(cfg.output.jsonPath, JSON.stringify(allRows, null, 2));
+    }
 
     console.log(`\nDone.`);
     console.log(`  Total founder rows: ${allRows.length}`);
     console.log(`  Rows with hiring roles populated: ${withRoles}`);
     console.log(`  Verified emails: ${verified.length}`);
-    console.log(`  CSV: ${path.resolve(cfg.output.csvPath)}`);
-    console.log(`  JSON: ${path.resolve(cfg.output.jsonPath)}`);
+    if (!watchFlag) {
+        console.log(`  CSV: ${path.resolve(cfg.output.csvPath)}`);
+        console.log(`  JSON: ${path.resolve(cfg.output.jsonPath)}`);
+    }
 }
 
 main().catch((e) => {
