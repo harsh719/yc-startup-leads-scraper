@@ -79,6 +79,10 @@ async function fetchYcCompanies() {
 }
 
 function filterCompanies(all, cfg) {
+    // --all flag: skip every ICP filter. Only basic sanity check.
+    if (cfg.all) {
+        return all.filter((c) => c.name);
+    }
     return all.filter((c) => {
         if (!c.name || !c.website) return false;
         if (c.status && ['Inactive', 'Dead'].includes(c.status)) return false;
@@ -144,13 +148,55 @@ function parseFoundersFromYcHtml(html) {
         const parts = fullName.split(/\s+/);
         if (parts.length < 2) continue;
         out.push({
+            fullName,
             firstName: parts[0],
             lastName: parts.slice(1).join(' '),
             title: typeof f.title === 'string' ? f.title.trim() : 'Founder',
             linkedinUrl: typeof f.linkedin_url === 'string' ? f.linkedin_url : null,
+            twitterUrl: typeof f.twitter_url === 'string' ? f.twitter_url : null,
+            bio: typeof f.founder_bio === 'string' ? f.founder_bio.trim() : null,
         });
     }
     return out;
+}
+
+// Fetch open roles from workatastartup.com — YC's standalone jobs board.
+// The company's WAS page contains a "jobs":[{title:..., ...}] JSON block.
+// Returns array of role title strings; empty array if the company isn't
+// listed there or has no open roles.
+async function fetchHiringRoles(slug) {
+    const url = `https://www.workatastartup.com/companies/${encodeURIComponent(slug)}`;
+    let html;
+    try {
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+                Accept: 'text/html,application/xhtml+xml',
+            },
+        });
+        if (!res.ok) return [];
+        html = await res.text();
+    } catch {
+        return [];
+    }
+    const decoded = html
+        .replace(/&quot;/g, '"')
+        .replace(/&#x27;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+    const json = extractJsonArrayAfterKey(decoded, '"jobs"');
+    if (!json) return [];
+    try {
+        const parsed = JSON.parse(json);
+        if (!Array.isArray(parsed)) return [];
+        return parsed
+            .map((j) => (j && typeof j.title === 'string') ? j.title.trim() : null)
+            .filter(Boolean);
+    } catch {
+        return [];
+    }
 }
 
 function extractJsonArrayAfterKey(s, key) {
@@ -299,7 +345,9 @@ function writeCsv(filePath, rows) {
 // ============================================================================
 
 async function main() {
-    const cfgPath = process.argv.find((a) => a.startsWith('--config='))?.split('=')[1] || 'config.json';
+    const argv = process.argv.slice(2);
+    const cfgPath = argv.find((a) => a.startsWith('--config='))?.split('=')[1] || 'config.json';
+    const allFlag = argv.includes('--all');
     let cfg = { ...DEFAULTS };
     if (fs.existsSync(cfgPath)) {
         try {
@@ -312,6 +360,7 @@ async function main() {
     } else {
         console.log(`No ${cfgPath} found. Using defaults. Set MAILSFINDER_API_KEY env var to enable email enrichment.`);
     }
+    if (allFlag) cfg.all = true;
     if (!cfg.mailsfinderApiKey && process.env.MAILSFINDER_API_KEY) {
         cfg.mailsfinderApiKey = process.env.MAILSFINDER_API_KEY;
         cfg.enableEmailEnrichment = true;
@@ -319,14 +368,19 @@ async function main() {
 
     console.log(`Fetching YC companies...`);
     const all = await fetchYcCompanies();
-    console.log(`Got ${all.length} total. Filtering...`);
+    console.log(`Got ${all.length} total. Filtering${cfg.all ? ' (--all flag: skipping ICP filters)' : ''}...`);
 
     const filtered = filterCompanies(all, cfg);
-    console.log(`After ICP filter: ${filtered.length}`);
+    console.log(`After filter: ${filtered.length}`);
 
-    console.log(`Fetching founders for ${filtered.length} companies (concurrency=${cfg.concurrency})...`);
+    console.log(`Fetching founders + hiring roles for ${filtered.length} companies (concurrency=${cfg.concurrency})...`);
     const enriched = await runWithConcurrency(filtered, cfg.concurrency, async (c) => {
-        const founders = await fetchYcFounders(c.slug);
+        // Two parallel fetches per company: YC page (founders) and Work-at-a-
+        // Startup page (open roles, only if isHiring=true).
+        const [founders, hiringRoles] = await Promise.all([
+            fetchYcFounders(c.slug),
+            c.isHiring === true ? fetchHiringRoles(c.slug) : Promise.resolve([]),
+        ]);
         const domain = extractDomain(c.website);
         const rows = [];
         for (const f of founders) {
@@ -338,21 +392,25 @@ async function main() {
             }
             rows.push({
                 company_name: c.name,
-                company_domain: domain,
-                industry: c.industry,
-                subindustry: c.subindustry || '',
-                team_size: c.team_size || '',
-                batch: c.batch || '',
-                location: c.all_locations || '',
-                first_name: f.firstName,
-                last_name: f.lastName,
+                full_name: f.fullName,
                 title: f.title,
+                linkedin_url: f.linkedinUrl || '',
+                twitter_url: f.twitterUrl || '',
+                bio: f.bio || '',
+                description_short: c.one_liner || '',
+                description_long: c.long_description || '',
+                team_size: c.team_size != null ? c.team_size : '',
+                industry: c.industry || '',
+                sub_industry: c.subindustry || '',
+                location: c.all_locations || '',
+                is_hiring: c.isHiring === true ? 'true' : 'false',
+                hiring_roles: hiringRoles.join('; '),
+                website: c.website || '',
+                batch: c.batch || '',
+                // bonus columns kept beyond your 14 — easy to drop if not needed:
                 email: email || '',
                 email_status: emailStatus,
-                linkedin_url: f.linkedinUrl || '',
                 yc_page: `https://www.ycombinator.com/companies/${c.slug}`,
-                website: c.website || '',
-                one_liner: c.one_liner || '',
             });
         }
         return rows;
@@ -360,12 +418,14 @@ async function main() {
 
     const allRows = enriched.flat().filter((r) => r && !r.error);
     const verified = allRows.filter((r) => r.email_status === 'verified');
+    const withRoles = allRows.filter((r) => r.hiring_roles).length;
 
     writeCsv(cfg.output.csvPath, allRows);
     fs.writeFileSync(cfg.output.jsonPath, JSON.stringify(allRows, null, 2));
 
     console.log(`\nDone.`);
     console.log(`  Total founder rows: ${allRows.length}`);
+    console.log(`  Rows with hiring roles populated: ${withRoles}`);
     console.log(`  Verified emails: ${verified.length}`);
     console.log(`  CSV: ${path.resolve(cfg.output.csvPath)}`);
     console.log(`  JSON: ${path.resolve(cfg.output.jsonPath)}`);

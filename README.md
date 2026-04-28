@@ -1,10 +1,15 @@
 # YC Startup Leads Scraper
 
-Standalone Node script that produces verified-email B2B leads from Y Combinator companies that are **currently hiring**.
+Standalone Node script that exports founder-level data for **every Y Combinator company** (or a filtered ICP slice). Pulls company metadata + founder names, titles, LinkedIn, Twitter, bio + currently-open hiring roles from Work-at-a-Startup. Optional verified-email lookup via [MailsFinder](https://mailsfinder.com).
 
-Single file. No dependencies beyond Node 20+. Reads YC's public company list, filters by ICP (industry, size, geography, `isHiring` flag, batch recency), fetches founder names + LinkedIn URLs from each company's YC page, optionally verifies emails via [MailsFinder](https://mailsfinder.com).
+Single file. No dependencies beyond Node 20+. Two modes:
 
-This is the proven pattern that produced ~75% verified-email hit rate in production runs.
+| Mode | Command | Purpose |
+|---|---|---|
+| **Filtered ICP leads** (default) | `node scrape.js` | Only currently-hiring YC companies in your ICP. Designed for B2B outbound. |
+| **Full export** | `node scrape.js --all` | Every YC company (~5,690), every listed founder. No filters. |
+
+Both modes use the same output schema.
 
 ## What you get
 
