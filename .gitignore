@@ -1,0 +1,9 @@
+node_modules/
+config.json
+leads.csv
+leads.json
+*.log
+.env
+.DS_Store
+.idea/
+.vscode/

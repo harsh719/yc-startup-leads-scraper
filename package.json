@@ -1,0 +1,11 @@
+{
+    "name": "yc-startup-leads-scraper",
+    "version": "0.1.0",
+    "description": "Standalone Node script: pull YC companies that are currently hiring, filter by ICP industry/size/geo, fetch founder data from each company's YC page, optionally verify emails via MailsFinder. Produces a CSV of B2B-outbound-ready leads.",
+    "type": "module",
+    "main": "scrape.js",
+    "scripts": {
+        "start": "node scrape.js"
+    },
+    "license": "MIT"
+}

@@ -1,0 +1,15 @@
+{
+    "industries": ["fintech", "healthtech", "hr_tech"],
+    "geographies": ["united_states", "canada"],
+    "employeeCountMin": 3,
+    "employeeCountMax": 200,
+    "requireIsHiring": true,
+    "batchYears": ["2024", "2025"],
+    "enableEmailEnrichment": true,
+    "mailsfinderApiKey": "PASTE_YOUR_MAILSFINDER_API_KEY_HERE",
+    "output": {
+        "csvPath": "leads.csv",
+        "jsonPath": "leads.json"
+    },
+    "concurrency": 8
+}
